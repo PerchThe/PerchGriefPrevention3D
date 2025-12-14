@@ -465,7 +465,7 @@ public class FlatFileDataStore extends DataStore
             }
         }
 
-        //link children to parents
+        //link children to parents and clean up legacy orphan subdivision files
         for (Claim child : orphans.keySet())
         {
             Claim parent = this.getClaim(orphans.get(child));
@@ -473,6 +473,18 @@ public class FlatFileDataStore extends DataStore
             {
                 child.parent = parent;
                 this.addClaim(child, false);
+                
+                // Delete the orphan subdivision file - subdivisions should only be stored
+                // inside their parent's YAML file, not as separate files
+                if (child.id != null)
+                {
+                    File orphanFile = new File(claimDataFolderPath + File.separator + child.id + ".yml");
+                    if (orphanFile.exists())
+                    {
+                        orphanFile.delete();
+                        GriefPrevention.AddLogEntry("Cleaned up legacy subdivision file: " + orphanFile.getName() + " (now stored in parent claim " + parent.id + ")");
+                    }
+                }
             }
         }
     }
@@ -709,6 +721,20 @@ public class FlatFileDataStore extends DataStore
     @Override
     synchronized void writeClaimToStorage(Claim claim)
     {
+        // Subdivisions are stored inside their root parent's YAML file.
+        // If this is a subdivision, find and save the root parent instead.
+        if (claim.parent != null)
+        {
+            Claim root = claim.parent;
+            while (root.parent != null)
+            {
+                root = root.parent;
+            }
+            // Save the root claim which will include this subdivision in its Children section
+            writeClaimToStorage(root);
+            return;
+        }
+
         String claimID = String.valueOf(claim.id);
 
         String yaml = this.getYamlForClaim(claim);

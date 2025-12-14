@@ -102,21 +102,16 @@ public abstract class UnifiedCommandHandler implements TabExecutor {
             @Override
             public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label,
                     @NotNull String[] args) {
-                // Prepend the subcommand name to args and delegate to the subcommand handler
-                String[] subArgs = new String[args.length + 1];
-                subArgs[0] = finalSubcommandName;
-                System.arraycopy(args, 0, subArgs, 1, args.length);
-                return handler.apply(sender, subArgs);
+                // For standalone commands, pass args directly to the handler without prepending subcommand name
+                // The handler expects the actual command arguments (e.g., player name for /trust)
+                return handler.apply(sender, args);
             }
 
             @Override
             public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command,
                     @NotNull String alias, @NotNull String[] args) {
-                // Prepend the subcommand name to args and delegate to the subcommand handler
-                String[] subArgs = new String[args.length + 1];
-                subArgs[0] = finalSubcommandName;
-                System.arraycopy(args, 0, subArgs, 1, args.length);
-                return UnifiedCommandHandler.this.onTabComplete(sender, command, alias, subArgs);
+                // For standalone commands, use args directly for tab completion
+                return UnifiedCommandHandler.this.onTabComplete(sender, command, alias, args);
             }
         };
 
@@ -173,21 +168,15 @@ public abstract class UnifiedCommandHandler implements TabExecutor {
             @Override
             public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label,
                     @NotNull String[] args) {
-                // Prepend the subcommand name to args and delegate to the subcommand handler
-                String[] subArgs = new String[args.length + 1];
-                subArgs[0] = finalSubcommandName;
-                System.arraycopy(args, 0, subArgs, 1, args.length);
-                return tabExecutor.onCommand(sender, command, label, subArgs);
+                // For standalone commands, pass args directly to the handler without prepending subcommand name
+                return tabExecutor.onCommand(sender, command, label, args);
             }
 
             @Override
             public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command,
                     @NotNull String alias, @NotNull String[] args) {
-                // Prepend the subcommand name to args and delegate to the subcommand handler
-                String[] subArgs = new String[args.length + 1];
-                subArgs[0] = finalSubcommandName;
-                System.arraycopy(args, 0, subArgs, 1, args.length);
-                return tabExecutor.onTabComplete(sender, command, alias, subArgs);
+                // For standalone commands, use args directly for tab completion
+                return tabExecutor.onTabComplete(sender, command, alias, args);
             }
         };
 

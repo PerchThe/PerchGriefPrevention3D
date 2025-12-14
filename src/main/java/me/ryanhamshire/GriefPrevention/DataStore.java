@@ -396,7 +396,18 @@ public abstract class DataStore {
         // subdivisions are added under their parent, not directly to the hash map for
         // direct search
         if (newClaim.parent != null) {
-            if (!newClaim.parent.children.contains(newClaim)) {
+            // Check by ID to prevent duplicates (object reference comparison is insufficient
+            // since the same subdivision may be loaded from multiple sources)
+            boolean alreadyExists = false;
+            if (newClaim.id != null) {
+                for (Claim child : newClaim.parent.children) {
+                    if (newClaim.id.equals(child.id)) {
+                        alreadyExists = true;
+                        break;
+                    }
+                }
+            }
+            if (!alreadyExists) {
                 newClaim.parent.children.add(newClaim);
             }
 
@@ -428,11 +439,6 @@ public abstract class DataStore {
         if (!newClaim.isAdminClaim() && writeToStorage) {
             PlayerData ownerData = this.getPlayerData(newClaim.ownerID);
             ownerData.getClaims().add(newClaim);
-        }
-
-        // make sure the claim is saved to disk
-        if (writeToStorage) {
-            this.saveClaim(newClaim);
         }
 
         // make sure the claim is saved to disk
