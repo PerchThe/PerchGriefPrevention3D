@@ -407,6 +407,16 @@ public abstract class DataStore {
                     }
                 }
             }
+            // Additional check: prevent duplicates by comparing boundaries during resize operations
+            // This catches cases where subdivisions might be added with the same boundaries but different timing
+            if (!alreadyExists) {
+                for (Claim child : newClaim.parent.children) {
+                    if (boundariesEqual(newClaim, child)) {
+                        alreadyExists = true;
+                        break;
+                    }
+                }
+            }
             if (!alreadyExists) {
                 newClaim.parent.children.add(newClaim);
             }
@@ -488,6 +498,25 @@ public abstract class DataStore {
                 }
             }
         }
+    }
+
+    // Helper method to compare claim boundaries for duplicate detection
+    private boolean boundariesEqual(Claim claim1, Claim claim2) {
+        if (claim1 == null || claim2 == null) return false;
+        if (claim1.parent != claim2.parent) return false;
+        
+        Location c1Lesser = claim1.getLesserBoundaryCorner();
+        Location c1Greater = claim1.getGreaterBoundaryCorner();
+        Location c2Lesser = claim2.getLesserBoundaryCorner();
+        Location c2Greater = claim2.getGreaterBoundaryCorner();
+        
+        return c1Lesser.getBlockX() == c2Lesser.getBlockX() &&
+               c1Lesser.getBlockY() == c2Lesser.getBlockY() &&
+               c1Lesser.getBlockZ() == c2Lesser.getBlockZ() &&
+               c1Greater.getBlockX() == c2Greater.getBlockX() &&
+               c1Greater.getBlockY() == c2Greater.getBlockY() &&
+               c1Greater.getBlockZ() == c2Greater.getBlockZ() &&
+               claim1.is3D() == claim2.is3D();
     }
 
     // turns a location into a string, useful in data storage
