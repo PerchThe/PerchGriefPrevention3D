@@ -3686,24 +3686,93 @@ public class GriefPrevention extends JavaPlugin {
             return true;
         }
 
-        // Build and display permissions list (simplified)
         ArrayList<String> builders = new ArrayList<>();
         ArrayList<String> containers = new ArrayList<>();
         ArrayList<String> accessors = new ArrayList<>();
         ArrayList<String> managers = new ArrayList<>();
         claim.getPermissions(builders, containers, accessors, managers);
 
+        ArrayList<String> inheritedBuilders = new ArrayList<>();
+        ArrayList<String> inheritedContainers = new ArrayList<>();
+        ArrayList<String> inheritedAccessors = new ArrayList<>();
+        ArrayList<String> inheritedManagers = new ArrayList<>();
+
+        boolean canInheritForDisplay = claim.parent != null
+                && claim.parent.parent == null
+                && !claim.getSubclaimRestrictions()
+                && !claim.is3D();
+
+        if (canInheritForDisplay) {
+            claim.parent.getPermissions(inheritedBuilders, inheritedContainers, inheritedAccessors,
+                    inheritedManagers);
+
+            java.util.function.Predicate<String> isDeniedBuilder = id -> claim.isPermissionDenied(id, ClaimPermission.Build);
+            java.util.function.Predicate<String> isDeniedContainer = id -> claim.isPermissionDenied(id, ClaimPermission.Inventory);
+            java.util.function.Predicate<String> isDeniedAccessor = id -> claim.isPermissionDenied(id, ClaimPermission.Access);
+            java.util.function.Predicate<String> isDeniedManager = id -> claim.isPermissionDenied(id, ClaimPermission.Manage);
+
+            inheritedBuilders.removeIf(isDeniedBuilder);
+            inheritedContainers.removeIf(isDeniedContainer);
+            inheritedAccessors.removeIf(isDeniedAccessor);
+            inheritedManagers.removeIf(isDeniedManager);
+        }
+
         GriefPrevention.sendMessage(player, TextMode.Info, Messages.TrustListHeader, claim.getOwnerName());
 
-        // Display permissions (simplified version)
-        StringBuilder perms = new StringBuilder();
-        if (!managers.isEmpty()) {
-            perms.append(ChatColor.GOLD).append("> ");
-            for (String manager : managers) {
-                perms.append(this.trustEntryToPlayerName(manager)).append(" ");
-            }
+        StringBuilder permissions = new StringBuilder();
+        permissions.append(ChatColor.GOLD).append('>');
+
+        Set<String> allManagers = new HashSet<>(managers);
+        allManagers.addAll(inheritedManagers);
+        if (!allManagers.isEmpty()) {
+            for (String manager : allManagers)
+                permissions.append(this.trustEntryToPlayerName(manager)).append(' ');
         }
-        player.sendMessage(perms.toString());
+
+        player.sendMessage(permissions.toString());
+        permissions = new StringBuilder();
+        permissions.append(ChatColor.YELLOW).append('>');
+
+        Set<String> allBuilders = new HashSet<>(builders);
+        allBuilders.addAll(inheritedBuilders);
+        if (!allBuilders.isEmpty()) {
+            for (String builder : allBuilders)
+                permissions.append(this.trustEntryToPlayerName(builder)).append(' ');
+        }
+
+        player.sendMessage(permissions.toString());
+        permissions = new StringBuilder();
+        permissions.append(ChatColor.GREEN).append('>');
+
+        Set<String> allContainers = new HashSet<>(containers);
+        allContainers.addAll(inheritedContainers);
+        if (!allContainers.isEmpty()) {
+            for (String container : allContainers)
+                permissions.append(this.trustEntryToPlayerName(container)).append(' ');
+        }
+
+        player.sendMessage(permissions.toString());
+        permissions = new StringBuilder();
+        permissions.append(ChatColor.BLUE).append('>');
+
+        Set<String> allAccessors = new HashSet<>(accessors);
+        allAccessors.addAll(inheritedAccessors);
+        if (!allAccessors.isEmpty()) {
+            for (String accessor : allAccessors)
+                permissions.append(this.trustEntryToPlayerName(accessor)).append(' ');
+        }
+
+        player.sendMessage(permissions.toString());
+
+        player.sendMessage(
+                ChatColor.GOLD + this.dataStore.getMessage(Messages.Manage) + " " +
+                        ChatColor.YELLOW + this.dataStore.getMessage(Messages.Build) + " " +
+                        ChatColor.GREEN + this.dataStore.getMessage(Messages.Containers) + " " +
+                        ChatColor.BLUE + this.dataStore.getMessage(Messages.Access));
+
+        if (claim.getSubclaimRestrictions()) {
+            GriefPrevention.sendMessage(player, TextMode.Err, Messages.HasSubclaimRestriction);
+        }
 
         return true;
     }
