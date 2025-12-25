@@ -15,7 +15,10 @@ import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import me.ryanhamshire.GriefPrevention.PlayerData;
+import org.bukkit.util.Transformation;
 import org.jetbrains.annotations.NotNull;
+import org.joml.AxisAngle4f;
+import org.joml.Vector3f;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -23,13 +26,102 @@ import java.util.Set;
 import java.util.UUID;
 public class GlowingVisualization extends FakeBlockVisualization {
 
-    private final Map<UUID, Set<BlockDisplay>> playerDisplays = new HashMap<>();
+    /** Per-player tracking container (single lock for Folia safety) */
+    private static final class Track {
+        final Set<BlockDisplay> displays = new HashSet<>();
+        final Set<Long> keys = new HashSet<>();
+        final Map<BlockDisplay, Long> keyByEntity = new HashMap<>();
+        int gen = 0; // increments when track is invalidated (prevents late tasks from resurrecting)
+    }
+    
+    private final Map<UUID, Track> tracks = new HashMap<>();
     private final Map<IntVector, BlockData> displayLocations = new HashMap<>();
     // Optional per-position glow color overrides (e.g., ADMIN_CLAIM glowstone corners -> orange)
     private final Map<IntVector, org.bukkit.Color> glowColorOverrides = new HashMap<>();
     private final GriefPrevention plugin;
     private static final float OUTLINE_SCALE = 1.005f;
-    private static final float OUTLINE_OFFSET = -(OUTLINE_SCALE - 1.0f) / 2.0f;
+    private static final String TAG_BASE = "gp_vis";
+    private static final String TAG_SUBDIV = "gp_vis_subdiv";
+    private static final String TAG_OUTLINE = "gp_vis_outline";
+    private static final AxisAngle4f ROT_IDENTITY = new AxisAngle4f(0f, 0f, 1f, 0f); // angle=0 means identity
+    // World min height offset for bit packing (supports y down to -2048)
+    private static final int Y_OFFSET = 2048;
+
+    /** Generate per-player tag for display ownership */
+    private static String tagFor(Player p) {
+        return TAG_BASE + "_" + p.getUniqueId();
+    }
+
+    /** Bit-pack block coords into a collision-free long key (x/z ±33M, y 0-4095 after offset) */
+    private static long key(int x, int y, int z) {
+        int py = y + Y_OFFSET;
+        // Guard against out-of-range Y (custom world heights beyond ±2048)
+        if ((py & ~0xFFF) != 0) {
+            py = Math.max(0, Math.min(0xFFF, py));
+        }
+        return (((long) x & 0x3FFFFFFL) << 38)
+             | (((long) z & 0x3FFFFFFL) << 12)
+             | ((long) py & 0xFFFL);
+    }
+
+    /** Get default glow color for a block material */
+    private static org.bukkit.Color defaultGlowColor(Material m) {
+        return switch (m) {
+            case GOLD_BLOCK, GLOWSTONE -> org.bukkit.Color.YELLOW;
+            case IRON_BLOCK, WHITE_WOOL -> org.bukkit.Color.WHITE;
+            case DIAMOND_BLOCK -> org.bukkit.Color.AQUA;
+            case REDSTONE_ORE, NETHERRACK -> org.bukkit.Color.RED;
+            case PUMPKIN -> org.bukkit.Color.ORANGE;
+            default -> org.bukkit.Color.YELLOW;
+        };
+    }
+
+    /** Get or create a Track for a player (synchronized on tracks map) */
+    private Track getOrCreateTrack(UUID playerId) {
+        synchronized (tracks) {
+            return tracks.computeIfAbsent(playerId, id -> new Track());
+        }
+    }
+
+    /** Get existing Track for a player, or null (synchronized on tracks map) */
+    private Track getTrack(UUID playerId) {
+        synchronized (tracks) {
+            return tracks.get(playerId);
+        }
+    }
+
+    /** Remove and return Track for a player (synchronized on tracks map) */
+    private Track removeTrack(UUID playerId) {
+        synchronized (tracks) {
+            return tracks.remove(playerId);
+        }
+    }
+
+    /**
+     * Remove a display and its associated key from tracking (Track overload for when you already have t).
+     * Safe to call with null display. All access synchronized on Track.
+     */
+    private void untrackDisplay(Track t, BlockDisplay display) {
+        if (display == null) return;
+        if (t != null) {
+            synchronized (t) {
+                Long k = t.keyByEntity.remove(display);
+                if (k != null) t.keys.remove(k);
+                t.displays.remove(display);
+            }
+        }
+        try {
+            if (display.isValid()) display.remove();
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Remove a display and its associated key from tracking (UUID overload for external callers).
+     * Safe to call with null display.
+     */
+    private void untrackDisplay(UUID playerId, BlockDisplay display) {
+        untrackDisplay(getTrack(playerId), display);
+    }
     
     public GlowingVisualization(@NotNull World world, @NotNull com.griefprevention.util.IntVector visualizeFrom, int height) {
         super(world, visualizeFrom, height);
@@ -38,55 +130,83 @@ public class GlowingVisualization extends FakeBlockVisualization {
 
     @Override
     public void handleBlockBreak(@NotNull Player player, @NotNull Block block) {
-        // Remove any BlockDisplay(s) for this player at this exact block position
-        Set<BlockDisplay> displays = playerDisplays.get(player.getUniqueId());
-        if (displays != null && !displays.isEmpty()) {
+        UUID playerId = player.getUniqueId();
+        Track t = getTrack(playerId);
+        
+        if (t != null) {
             int bx = block.getX();
             int by = block.getY();
             int bz = block.getZ();
-            // Remove matching display entities (accounting for slight offset)
-            displays.removeIf(d -> {
-                if (d == null || !d.isValid()) return true; // clean up invalid
-                Location dl = d.getLocation();
-                // Check if display is at the original position or the offset position
-                boolean match = (dl.getBlockX() == bx && dl.getBlockY() == by && dl.getBlockZ() == bz) ||
-                               (Math.abs(dl.getX() - (bx + OUTLINE_OFFSET)) < 0.1 &&
-                                Math.abs(dl.getY() - by) < 0.1 &&
-                                Math.abs(dl.getZ() - (bz + OUTLINE_OFFSET)) < 0.1);
-                if (match) {
-                    try { d.remove(); } catch (Exception ignored) {}
+            
+            // Collect targets under lock, then untrack outside
+            Set<BlockDisplay> toRemove = new HashSet<>();
+            synchronized (t) {
+                for (BlockDisplay d : t.displays) {
+                    if (d == null || !d.isValid()) {
+                        toRemove.add(d);
+                        continue;
+                    }
+                    Location dl = d.getLocation();
+                    if (dl.getWorld().equals(block.getWorld())
+                            && dl.getBlockX() == bx
+                            && dl.getBlockY() == by
+                            && dl.getBlockZ() == bz) {
+                        toRemove.add(d);
+                    }
                 }
-                return match;
-            });
+            }
+            // Untrack outside the iteration (use Track overload since we already have t)
+            for (BlockDisplay d : toRemove) {
+                untrackDisplay(t, d);
+            }
         }
 
-        // Remove from our recorded display locations so future refreshes don't recreate it
+        // Remove from our recorded display locations (two-pass: collect removed, then clean overrides)
+        int bx = block.getX();
+        int by = block.getY();
+        int bz = block.getZ();
         synchronized (this) {
-            displayLocations.remove(new IntVector(block.getX(), block.getY(), block.getZ()));
-            glowColorOverrides.remove(new IntVector(block.getX(), block.getY(), block.getZ()));
+            Set<IntVector> removed = new HashSet<>();
+            displayLocations.entrySet().removeIf(e -> {
+                IntVector v = e.getKey();
+                if (v.x() != bx || v.z() != bz) return false;
+                Material m = e.getValue().getMaterial();
+                boolean isSubdiv = (m == Material.WHITE_WOOL || m == Material.IRON_BLOCK);
+                boolean shouldRemove = isSubdiv ? (v.y() == by) : true;
+                if (shouldRemove) removed.add(v);
+                return shouldRemove;
+            });
+            glowColorOverrides.keySet().removeIf(removed::contains);
         }
 
         // so the clientside block (gold/iron/wool/etc.) disappears as well.
-        removeElementAt(player, new IntVector(block.getX(), block.getY(), block.getZ()));
+        removeElementAt(player, new IntVector(bx, by, bz));
     }
 
     @Override
     protected void apply(@NotNull Player player, @NotNull PlayerData playerData) {
-        // Immediately clear ALL existing displays for this player from any previous visualizations
-        // This handles cases where multiple visualization calls happen in quick succession
-        Set<BlockDisplay> existingDisplays = playerDisplays.get(player.getUniqueId());
-        if (existingDisplays != null) {
-            existingDisplays.forEach(display -> {
+        // Nuke and rebuild: remove existing entities, clear track, then rebuild
+        UUID playerId = player.getUniqueId();
+        Track t = getTrack(playerId);
+        
+        if (t != null) {
+            // Copy under lock, bump generation, then remove entities outside lock
+            Set<BlockDisplay> toRemove;
+            synchronized (t) {
+                t.gen++; // invalidate any pending tasks
+                toRemove = new HashSet<>(t.displays);
+                t.displays.clear();
+                t.keys.clear();
+                t.keyByEntity.clear();
+            }
+            for (BlockDisplay d : toRemove) {
                 try {
-                    if (display != null && display.isValid()) {
-                        display.remove();
-                    }
-                } catch (Exception e) {
-                    // Ignore - entity already removed
-                }
-            });
-            existingDisplays.clear();
+                    if (d != null && d.isValid()) d.remove();
+                } catch (Exception ignored) {}
+            }
         }
+        // Remove the track entry entirely (will be recreated fresh)
+        removeTrack(playerId);
 
         synchronized (this) {
             displayLocations.clear();
@@ -104,9 +224,7 @@ public class GlowingVisualization extends FakeBlockVisualization {
      * Immediately create displays for a player to avoid timing issues with multiple visualization calls
      */
     private void createDisplaysForPlayer(@NotNull Player player) {
-        if (!player.isOnline()) {
-            return;
-        }
+        if (!player.isOnline()) return;
 
         // Create a copy of the current display locations (populated by draw())
         Map<IntVector, BlockData> locationsToDisplay;
@@ -114,16 +232,15 @@ public class GlowingVisualization extends FakeBlockVisualization {
             locationsToDisplay = new HashMap<>(displayLocations);
         }
 
-        try {
-            // Create new displays set for this player
-            Set<BlockDisplay> displays = new HashSet<>();
-            playerDisplays.put(player.getUniqueId(), displays);
+        UUID playerId = player.getUniqueId();
+        Track t = getOrCreateTrack(playerId);
 
+        try {
             // Create displays for each location
             for (Map.Entry<IntVector, BlockData> entry : locationsToDisplay.entrySet()) {
                 IntVector pos = entry.getKey();
                 if (pos != null && world.isChunkLoaded(pos.x() >> 4, pos.z() >> 4)) {
-                    createBlockDisplay(player, pos, entry.getValue(), displays);
+                    createBlockDisplay(player, pos, entry.getValue(), t);
                 }
             }
         } catch (Exception e) {
@@ -143,57 +260,38 @@ public class GlowingVisualization extends FakeBlockVisualization {
     public void revert(@NotNull Player player) {
         super.revert(player);
 
-        // Comprehensive cleanup of all displays associated with this player
-        // This handles edge cases where displays might be associated with the player but not properly tracked
-
-        // Clear displays tracked for this specific player
-        Set<BlockDisplay> displays = playerDisplays.remove(player.getUniqueId());
-        if (displays != null && !displays.isEmpty()) {
-            for (BlockDisplay display : displays) {
+        UUID playerId = player.getUniqueId();
+        Track t = removeTrack(playerId);
+        boolean hadTrackedDisplays = false;
+        
+        if (t != null) {
+            // Copy under lock, bump generation, then remove entities outside
+            Set<BlockDisplay> toRemove;
+            synchronized (t) {
+                t.gen++; // invalidate any pending tasks
+                hadTrackedDisplays = !t.displays.isEmpty();
+                toRemove = new HashSet<>(t.displays);
+                t.displays.clear();
+                t.keys.clear();
+                t.keyByEntity.clear();
+            }
+            for (BlockDisplay d : toRemove) {
                 try {
-                    if (display != null && display.isValid()) {
-                        display.remove();
-                    }
-                } catch (Exception e) {
-                    // Ignore - entity already removed
-                }
+                    if (d != null && d.isValid()) d.remove();
+                } catch (Exception ignored) {}
             }
         }
 
-        // Additional safety net: check all display sets for any displays that might belong to this player
-        // This is important if multiple GlowingVisualization instances exist
-        for (Map.Entry<UUID, Set<BlockDisplay>> entry : playerDisplays.entrySet()) {
-            UUID otherPlayerId = entry.getKey();
-            if (!otherPlayerId.equals(player.getUniqueId())) {
-                Set<BlockDisplay> otherDisplays = entry.getValue();
-                if (otherDisplays != null) {
-                    // Remove any displays that might have been incorrectly associated with other players
-                    // This is a rare edge case but worth checking
-                    otherDisplays.removeIf(display -> {
-                        try {
-                            // If display is invalid or null, remove it from tracking
-                            if (display == null || !display.isValid()) {
-                                return true;
-                            }
-                            // Check if this display is actually at a location that should be associated with the current player
-                            // This is a heuristic check to catch misassociated displays
-                            Location displayLoc = display.getLocation();
-                            if (displayLoc != null && displayLoc.getWorld().equals(player.getWorld())) {
-                                // If the display is in the same world as the player and close to them,
-                                // it might be a leftover from a previous visualization
-                                if (displayLoc.distanceSquared(player.getLocation()) < 10000) { // Within 100 blocks
-                                    display.remove();
-                                    return true;
-                                }
-                            }
-                        } catch (Exception e) {
-                            // If we can't check the display, assume it's invalid and remove it
-                            return true;
-                        }
-                        return false;
-                    });
+        // Safety net: only scan if we suspect orphans (no tracked displays but player had visualization)
+        if (!hadTrackedDisplays) {
+            String playerTag = tagFor(player);
+            try {
+                for (Entity entity : player.getWorld().getNearbyEntities(player.getLocation(), 32, 32, 32)) {
+                    if (entity instanceof BlockDisplay && entity.getScoreboardTags().contains(playerTag)) {
+                        entity.remove();
+                    }
                 }
-            }
+            } catch (Exception ignored) {}
         }
 
         // Clear display locations to ensure no stale data remains
@@ -225,68 +323,76 @@ public class GlowingVisualization extends FakeBlockVisualization {
         }
     }
     
-    private void createBlockDisplay(Player player, IntVector pos, BlockData blockData, Set<BlockDisplay> displays) {
-        if (pos == null || blockData == null || displays == null || !player.isOnline()) {
-            return;
-        }
-
-        // Don't create new displays if the player logged out
-        if (!player.isOnline()) {
-            return;
-        }
+    private void createBlockDisplay(Player player, IntVector pos, BlockData blockData, Track t) {
+        if (pos == null || blockData == null || t == null || !player.isOnline()) return;
         
-        // Don't create duplicate displays (check both original and offset positions)
-        if (displays.stream().anyMatch(d ->
-            d != null && d.isValid() &&
-            ((d.getLocation().getBlockX() == pos.x() && d.getLocation().getBlockY() == pos.y() && d.getLocation().getBlockZ() == pos.z()) ||
-             (Math.abs(d.getLocation().getX() - (pos.x() + OUTLINE_OFFSET)) < 0.1 &&
-              Math.abs(d.getLocation().getY() - pos.y()) < 0.1 &&
-              Math.abs(d.getLocation().getZ() - (pos.z() + OUTLINE_OFFSET)) < 0.1)))) {
-            return;
-        }
-
         // For 3D subdivisions and 2D subdivisions, use exact coordinates without terrain snapping
-        // This ensures subdivisions show at their exact positions (including on glass)
         boolean isSubdivision = blockData.getMaterial() == Material.WHITE_WOOL ||
                                 blockData.getMaterial() == Material.IRON_BLOCK;
 
         int y;
         if (isSubdivision) {
-            // Use exact Y coordinate for subdivisions (both 2D and 3D)
             y = pos.y();
         } else {
-            // Use terrain snapping for other visualization types
             Block visibleLocation = getVisibleLocation(pos);
             y = visibleLocation.getY();
         }
 
-        // Create location at the determined position with slight offset to reduce z-fighting
-        // Ensure Y is within world bounds to match the terrain calculation bounds
+        // Ensure Y is within world bounds
         y = Math.max(world.getMinHeight(), Math.min(world.getMaxHeight(), y));
-        // Use a more significant offset to ensure proper separation from underlying blocks
-        Location loc = new Location(world, pos.x() + 0.01, y + 0.01, pos.z() + 0.01);
         
-        // Skip if location is in an unloaded chunk
+        // O(1) duplicate check - reserve key immediately under Track lock, capture generation
+        long posKey = key(pos.x(), y, pos.z());
+        final int myGen;
+        synchronized (t) {
+            myGen = t.gen;
+            if (!t.keys.add(posKey)) {
+                return; // already reserved/exists
+            }
+        }
+
+        // Spawn at exact block corner - alignment is handled by Transformation
+        Location loc = new Location(world, pos.x(), y, pos.z());
+        
+        // Skip if location is in an unloaded chunk - release reserved key
         if (!loc.getChunk().isLoaded()) {
+            synchronized (t) {
+                t.keys.remove(posKey);
+            }
             return;
         }
         
-        // Check for existing displays at this location and remove them
-        for (Entity entity : loc.getWorld().getNearbyEntities(loc, 0.1, 0.1, 0.1)) {
-            if (entity instanceof BlockDisplay) {
-                entity.remove();
-            }
-        }
+        // Tags for this display
+        String playerTag = tagFor(player);
+        String typeTag = isSubdivision ? TAG_SUBDIV : TAG_OUTLINE;
+        UUID playerId = player.getUniqueId();
         
         // Schedule the display creation using the proper entity scheduler
         SchedulerUtil.runLaterEntity(plugin, player, () -> {
+            // Check if track was invalidated (apply/revert called) before we got here
+            synchronized (t) {
+                if (t.gen != myGen) {
+                    t.keys.remove(posKey);
+                    return;
+                }
+            }
+            
             if (!player.isOnline() || !loc.getChunk().isLoaded()) {
+                // Release reserved key on early exit
+                synchronized (t) {
+                    if (t.gen == myGen) t.keys.remove(posKey);
+                }
                 return;
             }
             
             try {
                 // Create and initialize the display entity atomically to avoid global visibility flicker
                 BlockDisplay display = world.spawn(loc, BlockDisplay.class, spawned -> {
+                    // Tag this display for identification
+                    spawned.addScoreboardTag(TAG_BASE);      // base tag for all GP displays
+                    spawned.addScoreboardTag(playerTag);     // per-player tag
+                    spawned.addScoreboardTag(typeTag);       // type tag (subdiv vs outline)
+                    
                     // Make per-player only
                     spawned.setVisibleByDefault(false);
                     // Paper/Folia-compatible per-player visibility
@@ -303,53 +409,59 @@ public class GlowingVisualization extends FakeBlockVisualization {
                     spawned.setShadowStrength(0.0f);
                     spawned.setShadowRadius(0.0f);
 
-                    // Note: Transformation API may not be available in this Bukkit version
-                    // Using position offset instead for z-fighting prevention
+                    // Apply transformation: scale slightly larger and offset to stay centered
+                    // offset = -(scale - 1) / 2 recenters the scaled block on the original corner
+                    float s = OUTLINE_SCALE;
+                    float o = -(s - 1.0f) / 2.0f;
+                    spawned.setTransformation(new Transformation(
+                            new Vector3f(o, o, o),  // translation (recenter for scale)
+                            ROT_IDENTITY,           // left rotation (identity)
+                            new Vector3f(s, s, s),  // scale
+                            ROT_IDENTITY            // right rotation (identity)
+                    ));
 
                     spawned.setViewRange(96);
-                    spawned.setInterpolationDuration(1);
+                    spawned.setInterpolationDuration(0);  // No lerp slide on spawn
 
-                    // Apply glow color override
+                    // Apply glow color override (use pos directly as key - IntVector is immutable)
                     org.bukkit.Color override;
                     synchronized (GlowingVisualization.this) {
-                        override = glowColorOverrides.get(new IntVector(pos.x(), pos.y(), pos.z()));
+                        override = glowColorOverrides.get(pos);
                     }
-                    if (override != null) {
-                        spawned.setGlowColorOverride(override);
-                    } else if (blockData.getMaterial() == Material.GOLD_BLOCK) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.YELLOW);
-                    } else if (blockData.getMaterial() == Material.IRON_BLOCK) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.WHITE);
-                    } else if (blockData.getMaterial() == Material.WHITE_WOOL) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.WHITE);
-                    } else if (blockData.getMaterial() == Material.DIAMOND_BLOCK) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.AQUA);
-                    } else if (blockData.getMaterial() == Material.REDSTONE_ORE) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.RED);
-                    } else if (blockData.getMaterial() == Material.NETHERRACK) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.RED);
-                    } else if (blockData.getMaterial() == Material.GLOWSTONE) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.YELLOW);
-                    } else if (blockData.getMaterial() == Material.PUMPKIN) {
-                        spawned.setGlowColorOverride(org.bukkit.Color.ORANGE);
-                    } else {
-                        spawned.setGlowColorOverride(org.bukkit.Color.YELLOW);
-                    }
+                    spawned.setGlowColorOverride(override != null ? override : defaultGlowColor(blockData.getMaterial()));
                 });
 
-                // Track display for this player
-                synchronized (displays) {
-                    displays.add(display);
+                // Sanity check: if spawn succeeded but entity is instantly invalid, release key
+                if (display == null || !display.isValid()) {
+                    synchronized (t) {
+                        if (t.gen == myGen) t.keys.remove(posKey);
+                    }
+                    return;
+                }
+
+                // Track display and its key for this player (if track still valid)
+                synchronized (t) {
+                    if (t.gen != myGen) {
+                        // Track was invalidated after spawn - remove the orphan entity
+                        display.remove();
+                        return;
+                    }
+                    t.displays.add(display);
+                    t.keyByEntity.put(display, posKey);
                 }
 
                 // Schedule a check to ensure the display is still valid
                 SchedulerUtil.runLaterEntity(plugin, player, () -> {
                     if (display.isValid() && !player.getWorld().equals(display.getWorld())) {
-                        display.remove();
+                        untrackDisplay(playerId, display);
                     }
                 }, 20L);
 
             } catch (Exception e) {
+                // Release reserved key on failure (if track still valid)
+                synchronized (t) {
+                    if (t.gen == myGen) t.keys.remove(posKey);
+                }
                 plugin.getLogger().warning("Error creating block display at " + loc + ": " + e.getMessage());
                 if (e.getCause() != null) {
                     e.getCause().printStackTrace();
