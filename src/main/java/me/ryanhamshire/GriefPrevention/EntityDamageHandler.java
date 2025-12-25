@@ -42,6 +42,7 @@ import org.bukkit.event.entity.AreaEffectCloudApplyEvent;
 import org.bukkit.event.entity.EntityCombustEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityKnockbackByEntityEvent;
 import org.bukkit.event.entity.EntityTargetEvent;
 import org.bukkit.event.entity.PotionSplashEvent;
 import org.bukkit.event.vehicle.VehicleDamageEvent;
@@ -117,6 +118,46 @@ public class EntityDamageHandler implements Listener {
         this.handleEntityDamageEvent(new EntityDamageInstance(event), false);
     }
 
+    // Handle wind charge knockback - wind charges deal knockback separately from damage
+    @EventHandler(ignoreCancelled = true, priority = EventPriority.LOWEST)
+    public void onEntityKnockbackByEntity(@NotNull EntityKnockbackByEntityEvent event) {
+        // Only handle wind charge knockback on players
+        if (!(event.getEntity() instanceof Player defender))
+            return;
+
+        Entity source = event.getSourceEntity();
+        if (source == null)
+            return;
+
+        // Check if the source is a wind charge
+        String sourceTypeName = source.getType().name();
+        if (!sourceTypeName.contains("WIND_CHARGE"))
+            return;
+
+        // Get the player who threw the wind charge
+        Player attacker = null;
+        if (source instanceof Projectile projectile && projectile.getShooter() instanceof Player shooter) {
+            attacker = shooter;
+        }
+
+        // Allow self-knockback (e.g., for movement tricks)
+        if (attacker == null || attacker == defender)
+            return;
+
+        // Only protect when PVP rules are enabled for this world
+        if (!instance.pvpRulesApply(defender.getWorld()))
+            return;
+
+        // Check if defender is in a PVP-protected claim
+        PlayerData defenderData = dataStore.getPlayerData(defender.getUniqueId());
+        Claim claim = dataStore.getClaimAt(defender.getLocation(), false, defenderData.lastClaim);
+        if (claim != null && instance.claimIsPvPSafeZone(claim)) {
+            defenderData.lastClaim = claim;
+            event.setCancelled(true);
+            GriefPrevention.sendRateLimitedErrorMessage(attacker, Messages.CantFightWhileImmune);
+        }
+    }
+
     private void handleEntityDamageEvent(@NotNull EntityDamageInstance event, boolean sendMessages) {
         // monsters are never protected
         if (isHostile(event.damaged()))
@@ -168,6 +209,25 @@ public class EntityDamageHandler implements Listener {
             arrow = projectile;
             if (arrow.getShooter() instanceof Player shooter) {
                 attacker = shooter;
+            }
+        }
+
+        // Handle wind charge damage - wind charges are projectiles that deal knockback and damage
+        // When PVP rules are enabled for the world, protect players in claims from wind charge attacks
+        String damagerTypeName = damageSource != null ? damageSource.getType().name() : "";
+        if (damagerTypeName.contains("WIND_CHARGE") && event.damaged() instanceof Player defender) {
+            if (attacker != null && attacker != defender && instance.pvpRulesApply(defender.getWorld())) {
+                // Check if defender is in a protected claim
+                PlayerData defenderData = dataStore.getPlayerData(defender.getUniqueId());
+                Claim claim = dataStore.getClaimAt(defender.getLocation(), false, defenderData.lastClaim);
+                if (claim != null && instance.claimIsPvPSafeZone(claim)) {
+                    defenderData.lastClaim = claim;
+                    event.setCancelled(true);
+                    if (sendMessages) {
+                        GriefPrevention.sendRateLimitedErrorMessage(attacker, Messages.CantFightWhileImmune);
+                    }
+                    return;
+                }
             }
         }
 
@@ -378,9 +438,8 @@ public class EntityDamageHandler implements Listener {
             if (attackerData.pvpImmune || defenderData.pvpImmune) {
                 event.setCancelled(true);
                 if (sendMessages)
-                    GriefPrevention.sendMessage(
+                    GriefPrevention.sendRateLimitedErrorMessage(
                             attacker,
-                            TextMode.Err,
                             attackerData.pvpImmune ? Messages.CantFightWhileImmune : Messages.ThatPlayerPvPImmune);
                 return true;
             }
@@ -397,7 +456,7 @@ public class EntityDamageHandler implements Listener {
         Consumer<Messages> cancelHandler = message -> {
             event.setCancelled(true);
             if (sendMessages)
-                GriefPrevention.sendMessage(attacker, TextMode.Err, message);
+                GriefPrevention.sendRateLimitedErrorMessage(attacker, message);
         };
         // Return whether PVP is handled by a claim at the attacker or defender's
         // locations.
@@ -472,7 +531,7 @@ public class EntityDamageHandler implements Listener {
         if (attackerData.pvpImmune) {
             event.setCancelled(true);
             if (sendMessages)
-                GriefPrevention.sendMessage(attacker, TextMode.Err, Messages.CantFightWhileImmune);
+                GriefPrevention.sendRateLimitedErrorMessage(attacker, Messages.CantFightWhileImmune);
             return true;
         }
 
@@ -1091,7 +1150,7 @@ public class EntityDamageHandler implements Listener {
                     Consumer<Messages> cancelHandler = message -> {
                         event.setIntensity(affected, 0);
                         if (messagedPlayer.compareAndSet(false, true))
-                            GriefPrevention.sendMessage(thrower, TextMode.Err, message);
+                            GriefPrevention.sendRateLimitedErrorMessage(thrower, message);
                     };
                     if (handlePvpInClaim(thrower, affectedPlayer, thrower.getLocation(), playerData,
                             () -> cancelHandler.accept(Messages.CantFightWhileImmune))) {

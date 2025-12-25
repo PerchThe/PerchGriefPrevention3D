@@ -1326,8 +1326,8 @@ import me.ryanhamshire.GriefPrevention.util.SchedulerUtil;
              }
          }
  
-         //if the entity is an animal, apply container rules
-         if ((instance.config_claims_preventTheft && (entity instanceof Animals || entity instanceof Fish)) || (entity.getType() == EntityType.VILLAGER && instance.config_claims_villagerTradingRequiresTrust))
+         //if the entity is an animal or copper golem, apply container rules
+         if ((instance.config_claims_preventTheft && (entity instanceof Animals || entity instanceof Fish || entity.getType().name().equals("COPPER_GOLEM"))) || (entity.getType() == EntityType.VILLAGER && instance.config_claims_villagerTradingRequiresTrust))
          {
              //if the entity is in a claim
              Claim claim = this.dataStore.getClaimAt(entity.getLocation(), false, null);
@@ -1352,7 +1352,7 @@ import me.ryanhamshire.GriefPrevention.util.SchedulerUtil;
          }
  
          ItemStack itemInHand = instance.getItemInHand(player, event.getHand());
-
+ 
         //if preventing theft, prevent leashing claimed creatures and boats
         if (instance.config_claims_preventTheft && itemInHand.getType() == Material.LEAD)
         {

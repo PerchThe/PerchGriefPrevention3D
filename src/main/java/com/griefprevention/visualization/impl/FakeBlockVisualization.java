@@ -283,13 +283,17 @@ public class FakeBlockVisualization extends BlockBoundaryVisualization
 
     /**
      * Find a location that should be visible to players. This causes the visualization to "cling" to the ground.
+     * Always searches from the world surface downward to ensure consistent results regardless of player position.
      *
      * @param vector the {@link IntVector} of the display location
      * @return the located {@link Block}
      */
     protected @NotNull Block getVisibleLocation(@NotNull IntVector vector)
     {
-        Block start = vector.toBlock(world);
+        // Always start from the highest block at this X,Z to ensure consistent surface detection
+        // regardless of whether the player is underground or on the surface
+        int highestY = world.getHighestBlockYAt(vector.x(), vector.z());
+        Block start = world.getBlockAt(vector.x(), highestY, vector.z());
         return snapToSurface(start);
     }
 
@@ -301,6 +305,7 @@ public class FakeBlockVisualization extends BlockBoundaryVisualization
         Block column = start;
 
         // Step upward until we reach an open cell (air/liquid depending on context).
+        // This handles cases where getHighestBlockYAt returns a block below overhangs.
         while (!isTransparent(column) && column.getY() < maxY)
         {
             column = column.getRelative(BlockFace.UP);
@@ -456,7 +461,8 @@ public class FakeBlockVisualization extends BlockBoundaryVisualization
                 || Tag.FENCE_GATES.isTagged(blockMaterial)
                 || Tag.SIGNS.isTagged(blockMaterial)
                 || Tag.WALLS.isTagged(blockMaterial)
-                || Tag.WALL_SIGNS.isTagged(blockMaterial))
+                || Tag.WALL_SIGNS.isTagged(blockMaterial)
+                || Tag.LEAVES.isTagged(blockMaterial))
             return true;
 
         return block.getType().isTransparent();
